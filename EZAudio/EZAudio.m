@@ -32,18 +32,30 @@
                                       numberOfChannels:(UInt32)channels
                                            interleaved:(BOOL)interleaved
 {
-    AudioBufferList *audioBufferList = (AudioBufferList*)malloc(sizeof(AudioBufferList));
+    AudioBufferList *audioBufferList = (AudioBufferList*)malloc(sizeof(AudioBufferList) + sizeof(AudioBuffer)*(channels-1));
     UInt32 outputBufferSize = 32 * frames; // 32 KB
     audioBufferList->mNumberBuffers = interleaved ? 1 : channels;
     for (int i = 0; i < audioBufferList->mNumberBuffers; i++)
     {
-        audioBufferList->mBuffers[i].mNumberChannels = channels;
+        audioBufferList->mBuffers[i].mNumberChannels = 1;
         audioBufferList->mBuffers[i].mDataByteSize = channels * outputBufferSize;
         audioBufferList->mBuffers[i].mData = (float*)malloc(channels * sizeof(float) *outputBufferSize);
     }
     return audioBufferList;
 }
 
++ (float **)floatBuffersWithNumberOfFrames:(UInt32)frames
+                          numberOfChannels:(UInt32)channels
+{
+    size_t size = sizeof(float *) * channels;
+    float **buffers = (float **)malloc(size);
+    for (int i = 0; i < channels; i++)
+    {
+        size = sizeof(float) * frames;
+        buffers[i] = (float *)malloc(size);
+    }
+    return buffers;
+}
 
 
 + (void)freeBufferList:(AudioBufferList *)bufferList
@@ -67,7 +79,15 @@
     bufferList = NULL;
 }
 
-
++(void)freeFloatBuffers:(float **)buffers
+       numberOfChannels:(UInt32)channels
+{
+    for (int i = 0; i < channels; i++)
+    {
+        free(buffers[i]);
+    }
+    free(buffers);
+}
 
 #pragma mark - AudioStreamBasicDescription Utility
 + (AudioStreamBasicDescription)AIFFFormatWithNumberOfChannels:(UInt32)channels
@@ -108,7 +128,36 @@
     return asbd;
 }
 
++ (BOOL)isFloatFormat:(AudioStreamBasicDescription)asbd
+{
+    return asbd.mFormatFlags & kAudioFormatFlagIsFloat;
+}
 
++ (BOOL)isInterleaved:(AudioStreamBasicDescription)asbd
+{
+    return !(asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+}
+
++ (BOOL)isLinearPCM:(AudioStreamBasicDescription)asbd
+{
+    return asbd.mFormatID == kAudioFormatLinearPCM;
+}
+
++(AudioStreamBasicDescription)floatFormatWithNumberOfChannels:(UInt32)channels
+                                                   sampleRate:(float)sampleRate
+{
+    AudioStreamBasicDescription asbd;
+    UInt32 floatByteSize   = sizeof(float);
+    asbd.mBitsPerChannel   = 8 * floatByteSize;
+    asbd.mBytesPerFrame    = floatByteSize;
+    asbd.mBytesPerPacket   = floatByteSize;
+    asbd.mChannelsPerFrame = channels;
+    asbd.mFormatFlags      = kAudioFormatFlagIsFloat|kAudioFormatFlagIsNonInterleaved;
+    asbd.mFormatID         = kAudioFormatLinearPCM;
+    asbd.mFramesPerPacket  = 1;
+    asbd.mSampleRate       = sampleRate;
+    return asbd;
+}
 
 + (AudioStreamBasicDescription)M4AFormatWithNumberOfChannels:(UInt32)channels
                                                   sampleRate:(float)sampleRate
@@ -166,8 +215,8 @@
 }
 
 
-
-+ (AudioStreamBasicDescription)stereoCanonicalNonInterleavedFormatWithSampleRate:(float)sampleRate
++
+ (AudioStreamBasicDescription)stereoCanonicalNonInterleavedFormatWithSampleRate:(float)sampleRate
 {
     AudioStreamBasicDescription asbd;
     UInt32 byteSize = sizeof(float);
@@ -398,7 +447,6 @@
         }
     }
 }
-
 
 
 #pragma mark - TPCircularBuffer Utility

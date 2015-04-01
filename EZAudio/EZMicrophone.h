@@ -25,7 +25,6 @@
 
 #import  <Foundation/Foundation.h>
 #import  <AudioToolbox/AudioToolbox.h>
-#import  "AEFloatConverter.h"
 #import  "TargetConditionals.h"
 
 @class EZAudio;
@@ -227,6 +226,12 @@
  @return An AudioStreamBasicDescription structure describing the format of the microphone's audio.
  */
 -(AudioStreamBasicDescription)audioStreamBasicDescription;
+
+/**
+ Provides the underlying Audio Unit that is being used to fetch the audio.
+ @return The AudioUnit used for the microphone
+ */
+-(AudioUnit*)audioUnit;
 
 #pragma mark - Setters
 ///-----------------------------------------------------------

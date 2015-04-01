@@ -67,11 +67,17 @@
                                      numberOfChannels:(UInt32)channels
                                           interleaved:(BOOL)interleaved;
 
++(float **)floatBuffersWithNumberOfFrames:(UInt32)frames
+                         numberOfChannels:(UInt32)channels;
+
 /**
  Deallocates an AudioBufferList structure from memory.
  @param bufferList A pointer to the buffer list you would like to free
  */
 +(void)freeBufferList:(AudioBufferList*)bufferList;
+
++(void)freeFloatBuffers:(float **)buffers
+       numberOfChannels:(UInt32)channels;
 
 #pragma mark - AudioStreamBasicDescription Utilties
 ///-----------------------------------------------------------
@@ -93,6 +99,21 @@
  @return A new AudioStreamBasicDescription with the specified format.
  */
 +(AudioStreamBasicDescription)iLBCFormatWithSampleRate:(float)sampleRate;
+
++ (BOOL) isFloatFormat:(AudioStreamBasicDescription)asbd;
+
+/**
+ Checks an AudioStreamBasicDescription to check for an interleaved flag (samples are
+ stored in one buffer one after another instead of two (or n channels) parallel buffers
+ @param asbd A valid AudioStreamBasicDescription
+ @return A BOOL indicating whether or not the AudioStreamBasicDescription is interleaved
+ */
++ (BOOL) isInterleaved:(AudioStreamBasicDescription)asbd;
+
++ (BOOL) isLinearPCM:(AudioStreamBasicDescription)asbd;
+
++(AudioStreamBasicDescription)floatFormatWithNumberOfChannels:(UInt32)channels
+                                                   sampleRate:(float)sampleRate;
 
 /**
  

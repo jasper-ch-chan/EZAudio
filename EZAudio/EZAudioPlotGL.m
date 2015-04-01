@@ -298,9 +298,8 @@
 
     // Setup view
     [self _setupView];
+  
 }
-
-
 
 - (void)_setupBaseEffect
 {
@@ -323,20 +322,24 @@
         NSOpenGLPFAOpenGLProfile,
         NSOpenGLProfileVersion3_2Core, 0
     };
+	
+	NSOpenGLPixelFormat *pf      = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
+    NSOpenGLContext     *context = [[NSOpenGLContext alloc] initWithFormat:pf
+                                                              shareContext:nil];
 
-    NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
+    [self setWantsBestResolutionOpenGLSurface:YES];
 
     if (!pf)
     {
         NSLog(@"No OpenGL pixel format");
     }
 
-    NSOpenGLContext*context = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:nil];
-
     // Debug only
     CGLEnable([context CGLContextObj], kCGLCECrashOnRemovedFunctions);
 
-    self.pixelFormat   = pf;
+    NSLog(@"open gl context: %@",context);
+    
+    self.pixelFormat = pf;
     self.openGLContext = context;
 }
 
@@ -347,7 +350,6 @@
     self.backgroundColor = [NSColor colorWithCalibratedRed:0.796 green:0.749 blue:0.663 alpha:1];
     self.color           = [NSColor colorWithCalibratedRed:0.481 green:0.548 blue:0.637 alpha:1];
 }
-
 
 
 #pragma mark - Prepare
@@ -389,12 +391,14 @@
     // Set the background color
     [self _refreshWithBackgroundColor:self.backgroundColor];
     [self _refreshWithColor:self.color];
+  
+  const GLint flag = 0.5;
+  [[self openGLContext] setValues:&flag
+                     forParameter:NSOpenGLCPSurfaceOpacity];
 
     // Setup the display link (rendering loop)
     [self _setupDisplayLink];
 }
-
-
 
 - (void)_setupDisplayLink
 {
@@ -419,8 +423,6 @@
                                                object:[self window]];
 }
 
-
-
 - (void)windowWillClose:(NSNotification*)notification
 {
     // Stop the display link when the window is closing because default
@@ -444,7 +446,6 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink,
     CVReturn result = [(__bridge EZAudioPlotGL*)displayLinkContext getFrameForTime : outputTime];
     return result;
 }
-
 
 
 - (CVReturn)getFrameForTime:(const CVTimeStamp*)outputTime
@@ -633,8 +634,8 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink,
         // Draw the triangle
         glDrawArrays(_drawingType, 0, _bufferPlotGraphSize);
     }
+  
 }
-
 
 
 - (void)_drawRollingPlot
@@ -800,7 +801,6 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink,
     return _scrollHistoryLength;
 #endif
 }
-
 
 
 #pragma mark - Clearing

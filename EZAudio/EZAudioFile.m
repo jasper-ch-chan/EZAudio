@@ -25,343 +25,639 @@
 
 #import "EZAudioFile.h"
 
+//------------------------------------------------------------------------------
+
 #import "EZAudio.h"
+#import "EZAudioFloatConverter.h"
+#import "EZAudioFloatData.h"
+#include <pthread.h>
 
-#define kEZAudioFileWaveformDefaultResolution (1024)
+//------------------------------------------------------------------------------
 
-@interface EZAudioFile (){
-  
-  // Reading from the audio file
-  ExtAudioFileRef             _audioFile;
-  AudioStreamBasicDescription _clientFormat;
-  AudioStreamBasicDescription _fileFormat;
-  float                       **_floatBuffers;
-  AEFloatConverter            *_floatConverter;
-  SInt64                      _frameIndex;
-  CFURLRef                    _sourceURL;
-  Float32                     _totalDuration;
-  SInt64                      _totalFrames;
-  
-  // Waveform Data
-  float  *_waveformData;
-  UInt32 _waveformFrameRate;
-  UInt32 _waveformTotalBuffers;
-  
-}
+// errors
+static OSStatus EZAudioFileReadPermissionFileDoesNotExistCode = -88776;
+
+// constants
+static UInt32 EZAudioFileWaveformDefaultResolution = 1024;
+static NSString *EZAudioFileWaveformDataQueueIdentifier = @"com.ezaudio.waveformQueue";
+
+//------------------------------------------------------------------------------
+
+typedef struct
+{
+    AudioFileID                 audioFileID;
+    AudioStreamBasicDescription clientFormat;
+    float                       duration;
+    ExtAudioFileRef             extAudioFileRef;
+    AudioStreamBasicDescription fileFormat;
+    SInt64                      frames;
+    EZAudioFilePermission       permission;
+    CFURLRef                    sourceURL;
+} EZAudioFileInfo;
+
+//------------------------------------------------------------------------------
+#pragma mark - EZAudioFile
+//------------------------------------------------------------------------------
+
+@interface EZAudioFile ()
+@property (nonatomic, strong) EZAudioFloatConverter *floatConverter;
+@property (nonatomic) float **floatData;
+@property (nonatomic) EZAudioFileInfo info;
+@property (nonatomic) pthread_mutex_t lock;
+@property (nonatomic) dispatch_queue_t waveformQueue;
 @end
 
+//------------------------------------------------------------------------------
+
 @implementation EZAudioFile
-@synthesize audioFileDelegate = _audioFileDelegate;
-@synthesize waveformResolution = _waveformResolution;
 
-#pragma mark - Initializers
--(EZAudioFile*)initWithURL:(NSURL*)url {
-  self = [super init];
-  if(self){
-    _sourceURL = (__bridge CFURLRef)url;
-    [self _configureAudioFile];
-  }
-  return self;
-}
+//------------------------------------------------------------------------------
+#pragma mark - Initialization
+//------------------------------------------------------------------------------
 
--(EZAudioFile *)initWithURL:(NSURL *)url andDelegate:(id<EZAudioFileDelegate>)delegate {
-  self = [self initWithURL:url];
-  if(self){
-    self.audioFileDelegate = delegate;
-  }
-  return self;
-}
-
-#pragma mark - Class Initializers
-+(EZAudioFile*)audioFileWithURL:(NSURL*)url {
-  return [[EZAudioFile alloc] initWithURL:url];
-}
-
-+(EZAudioFile *)audioFileWithURL:(NSURL *)url andDelegate:(id<EZAudioFileDelegate>)delegate {
-  return [[EZAudioFile alloc] initWithURL:url andDelegate:delegate];
-}
-
-#pragma mark - Class Methods
-+(NSArray *)supportedAudioFileTypes {
-  return @[ @"aac",
-            @"caf",
-            @"aif",
-            @"aiff",
-            @"aifc",
-            @"mp3",
-            @"mp4",
-            @"m4a",
-            @"snd",
-            @"au",
-            @"sd2",
-            @"wav" ];
-}
-
-#pragma mark - Private Configuation
--(void)_configureAudioFile {
-  
-  // Source URL should not be nil
-  NSAssert(_sourceURL,@"Source URL was not specified correctly.");
-  
-  // Try to open the file for reading
-  [EZAudio checkResult:ExtAudioFileOpenURL(_sourceURL,&_audioFile)
-             operation:"Failed to open audio file for reading"];
-  
-  // Try pulling the stream description
-  UInt32 size = sizeof(_fileFormat);
-  [EZAudio checkResult:ExtAudioFileGetProperty(_audioFile,kExtAudioFileProperty_FileDataFormat, &size, &_fileFormat)
-             operation:"Failed to get audio stream basic description of input file"];
-  
-  // Try pulling the total frame size
-  size = sizeof(_totalFrames);
-  [EZAudio checkResult:ExtAudioFileGetProperty(_audioFile,kExtAudioFileProperty_FileLengthFrames, &size, &_totalFrames)
-             operation:"Failed to get total frames of input file"];
-  _totalFrames = MAX(1, _totalFrames);
-  
-  // Total duration
-  _totalDuration = _totalFrames / _fileFormat.mSampleRate;
-  
-  // Set the client format on the stream
-  switch (_fileFormat.mChannelsPerFrame) {
-    case 1:
-      _clientFormat = [EZAudio monoFloatFormatWithSampleRate:_fileFormat.mSampleRate];
-      break;
-    case 2:
-      _clientFormat = [EZAudio stereoFloatInterleavedFormatWithSampleRate:_fileFormat.mSampleRate];
-      break;
-    default:
-      break;
-  }
-    
-  [EZAudio checkResult:ExtAudioFileSetProperty(_audioFile,
-                                               kExtAudioFileProperty_ClientDataFormat,
-                                               sizeof (AudioStreamBasicDescription),
-                                               &_clientFormat)
-             operation:"Couldn't set client data format on input ext file"];
-  
-  // Allocate the float buffers
-  _floatConverter = [[AEFloatConverter alloc] initWithSourceFormat:_clientFormat];
-  size_t sizeToAllocate = sizeof(float*) * _clientFormat.mChannelsPerFrame;
-  sizeToAllocate = MAX(8, sizeToAllocate);
-  _floatBuffers   = (float**)malloc( sizeToAllocate );
-  UInt32 outputBufferSize = 32 * 1024; // 32 KB
-  for ( int i=0; i< _clientFormat.mChannelsPerFrame; i++ ) {
-    _floatBuffers[i] = (float*)malloc(outputBufferSize);
-  }
-  
-    [EZAudio printASBD:_fileFormat];
-    
-  // There's no waveform data yet
-  _waveformData = NULL;
-  
-  // Set the default resolution for the waveform data
-  _waveformResolution = kEZAudioFileWaveformDefaultResolution;
-  
-}
-
-#pragma mark - Events
--(void)readFrames:(UInt32)frames
-  audioBufferList:(AudioBufferList *)audioBufferList
-       bufferSize:(UInt32 *)bufferSize
-              eof:(BOOL *)eof {
-    [EZAudio checkResult:ExtAudioFileRead(_audioFile,
-                                          &frames,
-                                          audioBufferList)
-               operation:"Failed to read audio data from audio file"];
-    *bufferSize = audioBufferList->mBuffers[0].mDataByteSize/sizeof(float);
-    *eof = frames == 0;
-    _frameIndex += frames;
-    if( self.audioFileDelegate ){
-      if( [self.audioFileDelegate respondsToSelector:@selector(audioFile:updatedPosition:)] ){
-        [self.audioFileDelegate audioFile:self
-                          updatedPosition:_frameIndex];
-      }
-      if( [self.audioFileDelegate respondsToSelector:@selector(audioFile:readAudio:withBufferSize:withNumberOfChannels:)] ){
-        AEFloatConverterToFloat(_floatConverter,audioBufferList,_floatBuffers,frames);
-        [self.audioFileDelegate audioFile:self
-                                readAudio:_floatBuffers
-                           withBufferSize:frames
-                     withNumberOfChannels:_clientFormat.mChannelsPerFrame];
-      }
-    }
-}
-
--(void)seekToFrame:(SInt64)frame {
-  [EZAudio checkResult:ExtAudioFileSeek(_audioFile,frame)
-             operation:"Failed to seek frame position within audio file"];
-  _frameIndex = frame;
-  if( self.audioFileDelegate ){
-    if( [self.audioFileDelegate respondsToSelector:@selector(audioFile:updatedPosition:)] ){
-      [self.audioFileDelegate audioFile:self updatedPosition:_frameIndex];
-    }
-  }
-}
-
-#pragma mark - Getters
--(BOOL)hasLoadedAudioData {
-  return _waveformData != NULL;
-}
-
--(void)getWaveformDataWithCompletionBlock:(WaveformDataCompletionBlock)waveformDataCompletionBlock {
-  
-  SInt64 currentFramePosition = _frameIndex;
-  
-  if( _waveformData != NULL ){
-    waveformDataCompletionBlock( _waveformData, _waveformTotalBuffers );
-    return;
-  }
-  
-  _waveformFrameRate    = [self recommendedDrawingFrameRate];
-  _waveformTotalBuffers = [self minBuffersWithFrameRate:_waveformFrameRate];
-  _waveformData         = (float*)malloc(sizeof(float)*_waveformTotalBuffers);
-  
-  if( self.totalFrames == 0 ){
-    waveformDataCompletionBlock( _waveformData, _waveformTotalBuffers );
-    return;
-  }
-  
-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0ul), ^{
-    
-    for( int i = 0; i < _waveformTotalBuffers; i++ ){
-      
-      // Take a snapshot of each buffer through the audio file to form the waveform
-      AudioBufferList *bufferList = [EZAudio audioBufferListWithNumberOfFrames:_waveformFrameRate
-                                                              numberOfChannels:_clientFormat.mChannelsPerFrame
-                                                                   interleaved:YES];
-      UInt32 bufferSize;
-      BOOL eof;
-      
-      // Read in the specified number of frames
-      [EZAudio checkResult:ExtAudioFileRead(_audioFile,
-                                            &_waveformFrameRate,
-                                            bufferList)
-                 operation:"Failed to read audio data from audio file"];
-      bufferSize = bufferList->mBuffers[0].mDataByteSize/sizeof(float);
-      bufferSize = MAX(1, bufferSize);
-      eof = _waveformFrameRate == 0;
-      _frameIndex += _waveformFrameRate;
-      
-      // Calculate RMS of each buffer
-      float rms = [EZAudio RMS:bufferList->mBuffers[0].mData
-                        length:bufferSize];
-      _waveformData[i] = rms;
-      
-      // Since we malloc'ed, we should cleanup
-      [EZAudio freeBufferList:bufferList];
-      
-    }
-    
-    // Seek the audio file back to the beginning
-    [EZAudio checkResult:ExtAudioFileSeek(_audioFile,currentFramePosition)
-               operation:"Failed to seek frame position within audio file"];
-    _frameIndex = currentFramePosition;
-    
-    // Once we're done send off the waveform data
-    dispatch_async(dispatch_get_main_queue(), ^{
-      waveformDataCompletionBlock( _waveformData, _waveformTotalBuffers );
-    });
-
-  });
-  
-}
-
--(AudioStreamBasicDescription)clientFormat {
-  return _clientFormat;
-}
-
--(AudioStreamBasicDescription)fileFormat {
-  return _fileFormat;
-}
-
--(SInt64)frameIndex {
-  return _frameIndex;
-}
-
--(NSDictionary *)metadata
+- (instancetype)init
 {
-    AudioFileID audioFileID;
-    UInt32 propSize = sizeof(audioFileID);
+    self = [super init];
+    if (self)
+    {
+        memset(&_info, 0, sizeof(_info));
+        _floatData = NULL;
+        _info.permission = EZAudioFilePermissionRead;
+        pthread_mutex_init(&_lock, NULL);
+        _waveformQueue = dispatch_queue_create(EZAudioFileWaveformDataQueueIdentifier.UTF8String, DISPATCH_QUEUE_PRIORITY_DEFAULT);
+    }
+    return self;
+}
+
+//------------------------------------------------------------------------------
+
+- (instancetype)initWithURL:(NSURL *)url
+{
+    AudioStreamBasicDescription asbd;
+    return [self initWithURL:url
+                  permission:EZAudioFilePermissionRead
+                  fileFormat:asbd];
+}
+
+//------------------------------------------------------------------------------
+
+- (instancetype)initWithURL:(NSURL*)url
+                 permission:(EZAudioFilePermission)permission
+                 fileFormat:(AudioStreamBasicDescription)fileFormat
+{
+    return [self initWithURL:url
+                    delegate:nil
+                  permission:permission
+                  fileFormat:fileFormat];
+}
+
+//------------------------------------------------------------------------------
+
+- (instancetype)initWithURL:(NSURL*)url
+                   delegate:(id<EZAudioFileDelegate>)delegate
+                 permission:(EZAudioFilePermission)permission
+                 fileFormat:(AudioStreamBasicDescription)fileFormat
+{
+    return [self initWithURL:url
+                    delegate:delegate
+                  permission:permission
+                  fileFormat:fileFormat
+                clientFormat:[self.class defaultClientFormat]];
+}
+
+//------------------------------------------------------------------------------
+
+- (instancetype)initWithURL:(NSURL*)url
+                   delegate:(id<EZAudioFileDelegate>)delegate
+                 permission:(EZAudioFilePermission)permission
+                 fileFormat:(AudioStreamBasicDescription)fileFormat
+               clientFormat:(AudioStreamBasicDescription)clientFormat
+{
+    self = [self init];
+    if(self)
+    {
+        _info.clientFormat = clientFormat;
+        _info.fileFormat = fileFormat;
+        _info.permission = permission;
+        _info.sourceURL = (__bridge CFURLRef)url;
+        self.delegate = delegate;
+        [self setup];
+    }
+    return self;
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Class Initializers
+//------------------------------------------------------------------------------
+
++ (instancetype)audioFileWithURL:(NSURL*)url
+{
+    return [[self alloc] initWithURL:url];
+}
+
+//------------------------------------------------------------------------------
+
++ (instancetype)audioFileWithURL:(NSURL*)url
+                      permission:(EZAudioFilePermission)permission
+                      fileFormat:(AudioStreamBasicDescription)fileFormat
+{
+    return [[self alloc] initWithURL:url
+                          permission:permission
+                          fileFormat:fileFormat];
+}
+
+//------------------------------------------------------------------------------
+
++ (instancetype)audioFileWithURL:(NSURL*)url
+                        delegate:(id<EZAudioFileDelegate>)delegate
+                      permission:(EZAudioFilePermission)permission
+                      fileFormat:(AudioStreamBasicDescription)fileFormat
+{
+    return [[self alloc] initWithURL:url
+                            delegate:delegate
+                          permission:permission
+                          fileFormat:fileFormat];
+}
+
+//------------------------------------------------------------------------------
+
++ (instancetype)audioFileWithURL:(NSURL*)url
+                        delegate:(id<EZAudioFileDelegate>)delegate
+                      permission:(EZAudioFilePermission)permission
+                      fileFormat:(AudioStreamBasicDescription)fileFormat
+                    clientFormat:(AudioStreamBasicDescription)clientFormat
+{
+    return [[self alloc] initWithURL:url
+                            delegate:delegate
+                          permission:permission
+                          fileFormat:fileFormat
+                        clientFormat:clientFormat];
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Class Methods
+//------------------------------------------------------------------------------
+
++ (AudioStreamBasicDescription)defaultClientFormat
+{
+    return [EZAudio stereoFloatNonInterleavedFormatWithSampleRate:44100];
+}
+
+//------------------------------------------------------------------------------
+
++ (NSArray *)supportedAudioFileTypes
+{
+    return @[
+        @"aac",
+        @"caf",
+        @"aif",
+        @"aiff",
+        @"aifc",
+        @"mp3",
+        @"mp4",
+        @"m4a",
+        @"snd",
+        @"au",
+        @"sd2",
+        @"wav"
+    ];
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Setup
+//------------------------------------------------------------------------------
+
+- (void)setup
+{
+    // we open the file differently depending on the permissions specified
+    [EZAudio checkResult:[self openAudioFile]
+               operation:"Failed to create/open audio file"];
     
-    [EZAudio checkResult:ExtAudioFileGetProperty(_audioFile,
-                                                 kExtAudioFileProperty_AudioFile,
-                                                 &propSize,
-                                                 &audioFileID)
-               operation:"Failed to get audio file id"];
+    // set the client format
+    self.clientFormat = self.info.clientFormat;
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Creating/Opening Audio File
+//------------------------------------------------------------------------------
+
+- (OSStatus)openAudioFile
+{
+    // need a source url
+    NSAssert(_info.sourceURL, @"EZAudioFile cannot be created without a source url!");
     
+    // determine if the file actually exists
+    CFURLRef url        = self.info.sourceURL;
+    NSURL    *fileURL   = (__bridge NSURL *)(url);
+    BOOL     fileExists = [[NSFileManager defaultManager] fileExistsAtPath:fileURL.path];
+    
+    // create the file wrapper slightly differently depending what we are
+    // trying to do with it
+    OSStatus              result     = noErr;
+    EZAudioFilePermission permission = self.info.permission;
+    UInt32                propSize;
+    if (fileExists)
+    {
+        result = AudioFileOpenURL(url,
+                                  permission,
+                                  0,
+                                  &_info.audioFileID);
+        [EZAudio checkResult:result
+                   operation:"failed to open audio file"];
+    }
+    else
+    {
+        // read permission is not applicable because the file does not exist
+        if (permission == EZAudioFilePermissionRead)
+        {
+            result = EZAudioFileReadPermissionFileDoesNotExistCode;
+        }
+        else
+        {
+            result = AudioFileCreateWithURL(url,
+                                            0,
+                                            &_info.fileFormat,
+                                            kAudioFileFlags_EraseFile,
+                                            &_info.audioFileID);
+        }
+    }
+    
+    // get the ExtAudioFile wrapper
+    if (result == noErr)
+    {
+        [EZAudio checkResult:ExtAudioFileWrapAudioFileID(self.info.audioFileID,
+                                                         false,
+                                                         &_info.extAudioFileRef)
+                   operation:"Failed to wrap audio file ID in ext audio file ref"];
+    }
+    
+    // store the file format if we opened an existing file
+    if (fileExists)
+    {
+        propSize = sizeof(self.info.fileFormat);
+        [EZAudio checkResult:ExtAudioFileGetProperty(self.info.extAudioFileRef,
+                                                     kExtAudioFileProperty_FileDataFormat,
+                                                     &propSize,
+                                                     &_info.fileFormat)
+                   operation:"Failed to get file audio format on existing audio file"];
+    }
+    
+    // done
+    return result;
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Events
+//------------------------------------------------------------------------------
+
+- (void)readFrames:(UInt32)frames
+    audioBufferList:(AudioBufferList *)audioBufferList
+         bufferSize:(UInt32 *)bufferSize
+               eof:(BOOL *)eof
+{
+    if (pthread_mutex_trylock(&_lock) == 0)
+    {
+        // perform read
+        [EZAudio checkResult:ExtAudioFileRead(self.info.extAudioFileRef,
+                                              &frames,
+                                              audioBufferList)
+                   operation:"Failed to read audio data from file"];
+        *bufferSize = frames;
+        *eof = frames == 0;
+        
+        // notify delegate
+        if ([self.delegate respondsToSelector:@selector(audioFile:updatedPosition:)])
+        {
+            [self.delegate audioFile:self
+                     updatedPosition:self.frameIndex];
+        }
+        
+        // convert into float data
+        [self.floatConverter convertDataFromAudioBufferList:audioBufferList
+                                         withNumberOfFrames:*bufferSize
+                                             toFloatBuffers:self.floatData];
+        
+        pthread_mutex_unlock(&_lock);
+        
+        if ([self.delegate respondsToSelector:@selector(audioFile:readAudio:withBufferSize:withNumberOfChannels:)])
+        {
+            UInt32 channels = self.clientFormat.mChannelsPerFrame;
+            [self.delegate audioFile:self
+                           readAudio:self.floatData
+                      withBufferSize:*bufferSize
+                withNumberOfChannels:channels];
+            
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+
+- (void)seekToFrame:(SInt64)frame
+{
+    if (pthread_mutex_trylock(&_lock) == 0)
+    {
+        [EZAudio checkResult:ExtAudioFileSeek(self.info.extAudioFileRef,
+                                              frame)
+                   operation:"Failed to seek frame position within audio file"];
+        pthread_mutex_unlock(&_lock);
+        
+        // notify delegate
+        if ([self.delegate respondsToSelector:@selector(audioFile:updatedPosition:)])
+        {
+            [self.delegate audioFile:self
+                     updatedPosition:self.frameIndex];
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - Getters
+//------------------------------------------------------------------------------
+
+- (AudioStreamBasicDescription)floatFormat
+{
+    return [EZAudio stereoFloatNonInterleavedFormatWithSampleRate:44100];
+}
+
+//------------------------------------------------------------------------------
+
+- (EZAudioFloatData *)getWaveformData
+{
+    return [self getWaveformDataWithNumberOfPoints:EZAudioFileWaveformDefaultResolution];
+}
+
+//------------------------------------------------------------------------------
+
+- (EZAudioFloatData *)getWaveformDataWithNumberOfPoints:(UInt32)numberOfPoints
+{
+    EZAudioFloatData *waveformData;
+    if (pthread_mutex_trylock(&_lock) == 0)
+    {
+        // store current frame
+        SInt64 currentFrame     = self.frameIndex;
+        UInt32 channels         = self.clientFormat.mChannelsPerFrame;
+        BOOL   interleaved      = [EZAudio isInterleaved:self.clientFormat];
+        SInt64 totalFrames      = self.totalClientFrames;
+        SInt64 framesPerBuffer  = ((SInt64) totalFrames / numberOfPoints);
+        SInt64 framesPerChannel = framesPerBuffer / channels;
+        float  **data           = (float **)malloc( sizeof(float *) * channels );
+        for (int i = 0; i < channels; i++)
+        {
+            data[i] = (float *)malloc( sizeof(float) * numberOfPoints );
+        }
+        
+        // seek to 0
+        [EZAudio checkResult:ExtAudioFileSeek(self.info.extAudioFileRef,
+                                              0)
+                   operation:"Failed to seek frame position within audio file"];
+        
+        // allocate an audio buffer list
+        AudioBufferList *audioBufferList = [EZAudio audioBufferListWithNumberOfFrames:(UInt32)totalFrames
+                                                                     numberOfChannels:self.info.clientFormat.mChannelsPerFrame
+                                                                          interleaved:interleaved];
+
+        UInt32 bufferSize = (UInt32)totalFrames;
+        [EZAudio checkResult:ExtAudioFileRead(self.info.extAudioFileRef,
+                                              &bufferSize,
+                                              audioBufferList)
+                   operation:"Failed to read audio data from file waveform"];
+        
+        // read through file and calculate rms at each point
+        SInt64 offset = 0;
+        for (SInt64 i = 0; i < numberOfPoints; i++)
+        {
+            float buffer[framesPerBuffer];
+            if (interleaved)
+            {
+                float *samples = (float *)audioBufferList->mBuffers[0].mData;
+                memcpy(buffer, &samples[offset], framesPerBuffer * sizeof(float));
+                for (int channel = 0; channel < channels; channel++)
+                {
+                    float channelData[framesPerChannel];
+                    for (int frame = 0; frame < framesPerChannel; frame++)
+                    {
+                        channelData[frame] = buffer[frame * channels + channel];
+                    }
+                    float rms = [EZAudio RMS:channelData length:(UInt32)framesPerChannel];
+                    data[channel][i] = rms;
+                }
+                offset += channels * framesPerBuffer;
+            }
+            else
+            {
+                for (int channel = 0; channel < channels; channel++)
+                {
+                    float *samples = (float *)audioBufferList->mBuffers[channel].mData;
+                    memcpy(buffer, &samples[offset], framesPerBuffer * sizeof(float));
+                    float rms = [EZAudio RMS:buffer length:(UInt32)framesPerBuffer];
+                    data[channel][i] = rms;
+                }
+                offset += framesPerBuffer;
+            }
+        }
+        
+        // clean up
+        [EZAudio freeBufferList:audioBufferList];
+        
+        // seek back to previous position
+        [EZAudio checkResult:ExtAudioFileSeek(self.info.extAudioFileRef,
+                                              currentFrame)
+                   operation:"Failed to seek frame position within audio file"];
+        
+        pthread_mutex_unlock(&_lock);
+        
+        waveformData = [EZAudioFloatData dataWithNumberOfChannels:channels
+                                                             buffers:(float **)data
+                                                          bufferSize:numberOfPoints];
+        
+        // cleanup
+        for (int i = 0; i < channels; i++)
+        {
+            free(data[i]);
+        }
+        free(data);
+    }
+    return waveformData;
+}
+
+//------------------------------------------------------------------------------
+
+- (void)getWaveformDataWithCompletionBlock:(WaveformDataCompletionBlock)waveformDataCompletionBlock
+{
+    [self getWaveformDataWithNumberOfPoints:EZAudioFileWaveformDefaultResolution
+                                 completion:waveformDataCompletionBlock];
+}
+
+//------------------------------------------------------------------------------
+
+- (void)getWaveformDataWithNumberOfPoints:(UInt32)numberOfPoints
+                               completion:(WaveformDataCompletionBlock)completion
+{
+    if (!completion)
+    {
+        return;
+    }
+
+    // async get waveform data
+    __weak EZAudioFile *weakSelf = self;
+    dispatch_async(self.waveformQueue, ^{
+        EZAudioFloatData *waveformData = [weakSelf getWaveformDataWithNumberOfPoints:numberOfPoints];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(waveformData);
+        });
+    });
+}
+
+//------------------------------------------------------------------------------
+
+- (AudioStreamBasicDescription)clientFormat
+{
+    return self.info.clientFormat;
+}
+
+//------------------------------------------------------------------------------
+
+- (AudioStreamBasicDescription)fileFormat
+{
+    return self.info.fileFormat;
+}
+
+//------------------------------------------------------------------------------
+
+- (SInt64)frameIndex
+{
+    SInt64 frameIndex;
+    [EZAudio checkResult:ExtAudioFileTell(self.info.extAudioFileRef, &frameIndex)
+               operation:"Failed to get frame index"];
+    return frameIndex;
+}
+
+//------------------------------------------------------------------------------
+
+- (NSDictionary *)metadata
+{
+    // get size of metadata property (dictionary)
+    UInt32          propSize = sizeof(_info.audioFileID);
     CFDictionaryRef metadata;
-    UInt32 isWritable;
-    [EZAudio checkResult:AudioFileGetPropertyInfo(audioFileID,
+    UInt32          writable;
+    [EZAudio checkResult:AudioFileGetPropertyInfo(self.info.audioFileID,
                                                   kAudioFilePropertyInfoDictionary,
                                                   &propSize,
-                                                  &isWritable)
+                                                  &writable)
                operation:"Failed to get the size of the metadata dictionary"];
     
-    [EZAudio checkResult:AudioFileGetProperty(audioFileID,
+    // pull metadata
+    [EZAudio checkResult:AudioFileGetProperty(self.info.audioFileID,
                                               kAudioFilePropertyInfoDictionary,
                                               &propSize,
                                               &metadata)
                operation:"Failed to get metadata dictionary"];
     
-    return (__bridge NSDictionary *)metadata;
+    // cast to NSDictionary
+    return (__bridge NSDictionary*)metadata;
 }
 
--(Float32)totalDuration {
-  return _totalDuration;
+//------------------------------------------------------------------------------
+
+- (NSTimeInterval)totalDuration
+{
+    SInt64 totalFrames = [self totalFrames];
+    return (NSTimeInterval) totalFrames / self.info.fileFormat.mSampleRate;
 }
 
--(SInt64)totalFrames {
-  return _totalFrames;
-}
+//------------------------------------------------------------------------------
 
--(NSURL *)url {
-  return (__bridge NSURL*)_sourceURL;
-}
-
-#pragma mark - Setters
--(void)setWaveformResolution:(UInt32)waveformResolution {
-  if( _waveformResolution != waveformResolution ){
-    _waveformResolution = waveformResolution;
-    if( _waveformData ){
-      free(_waveformData);
-      _waveformData = NULL;
+- (SInt64)totalClientFrames
+{
+    SInt64 totalFrames = [self totalFrames];
+    
+    // check sample rate of client vs file format
+    AudioStreamBasicDescription clientFormat = self.info.clientFormat;
+    AudioStreamBasicDescription fileFormat   = self.info.fileFormat;
+    BOOL sameSampleRate = clientFormat.mSampleRate == fileFormat.mSampleRate;
+    if (!sameSampleRate)
+    {
+        NSTimeInterval duration = [self totalDuration];
+        totalFrames = duration * clientFormat.mSampleRate;
     }
-  }
+    
+    return totalFrames;
 }
 
-#pragma mark - Helpers
--(UInt32)minBuffersWithFrameRate:(UInt32)frameRate {
-  frameRate = frameRate > 0 ? frameRate : 1;
-  UInt32 val = (UInt32) _totalFrames / frameRate + 1;
-  return MAX(1, val);
+//------------------------------------------------------------------------------
+
+- (SInt64)totalFrames
+{
+    SInt64 totalFrames;
+    UInt32 size = sizeof(SInt64);
+    [EZAudio checkResult:ExtAudioFileGetProperty(self.info.extAudioFileRef,
+                                                 kExtAudioFileProperty_FileLengthFrames,
+                                                 &size,
+                                                 &totalFrames)
+               operation:"Failed to get total frames"];
+    return totalFrames;
 }
 
--(UInt32)recommendedDrawingFrameRate {
-  UInt32 val = 1;
-  if(_waveformResolution > 0){
-    val = (UInt32) _totalFrames / _waveformResolution;
-    if(val > 1)
-      --val;
-  }
-  return MAX(1, val);
+//------------------------------------------------------------------------------
+
+- (NSURL*)url
+{
+  return (__bridge NSURL*)self.info.sourceURL;
 }
 
-#pragma mark - Cleanup
--(void)dealloc {
-  if( _waveformData ){
-    free(_waveformData);
-    _waveformData = NULL;
-  }
-//  if( _floatBuffers ){
-//    free(_floatBuffers);
-//    _floatBuffers = NULL;
-//  }
-  _frameIndex = 0;
-  _waveformFrameRate = 0;
-  _waveformTotalBuffers = 0;
-  if( _audioFile ){
-    [EZAudio checkResult:ExtAudioFileDispose(_audioFile)
-               operation:"Failed to dispose of audio file"];
-  }
+//------------------------------------------------------------------------------
+#pragma mark - Setters
+//------------------------------------------------------------------------------
+
+- (void)setClientFormat:(AudioStreamBasicDescription)clientFormat
+{
+    NSAssert([EZAudio isLinearPCM:clientFormat], @"Client format must be linear PCM");
+    
+    // store the client format
+    _info.clientFormat = clientFormat;
+    
+    // set the client format on the extended audio file ref
+    [EZAudio checkResult:ExtAudioFileSetProperty(self.info.extAudioFileRef,
+                                                 kExtAudioFileProperty_ClientDataFormat,
+                                                 sizeof(clientFormat),
+                                                 &clientFormat)
+               operation:"Couldn't set client data format on file"];
+    
+    // create a new float converter using the client format as the input format
+    self.floatConverter = [EZAudioFloatConverter converterWithInputFormat:clientFormat];
+    
+    UInt32 maxPacketSize;
+    UInt32 propSize = sizeof(maxPacketSize);
+    [EZAudio checkResult:ExtAudioFileGetProperty(self.info.extAudioFileRef,
+                                                 kExtAudioFileProperty_ClientMaxPacketSize,
+                                                 &propSize,
+                                                 &maxPacketSize)
+               operation:"Failed to get max packet size"];
+    
+    
+    
+    // figure out what the max packet size is
+    
+    
+    
+    
+    
+    
+    self.floatData = [EZAudio floatBuffersWithNumberOfFrames:1024
+                                            numberOfChannels:self.clientFormat.mChannelsPerFrame];
 }
+
+//------------------------------------------------------------------------------
+
+-(void)dealloc
+{
+    pthread_mutex_destroy(&_lock);
+    [EZAudio freeFloatBuffers:self.floatData numberOfChannels:self.clientFormat.mChannelsPerFrame];
+    [EZAudio checkResult:AudioFileClose(self.info.audioFileID) operation:"Failed to close audio file"];
+    [EZAudio checkResult:ExtAudioFileDispose(self.info.extAudioFileRef) operation:"Failed to dispose of ext audio file"];
+}
+
+//------------------------------------------------------------------------------
 
 @end
